@@ -1,83 +1,119 @@
 ﻿using copy_app;
 using Ionic.Zip;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using qbch_db_saver_sdc;
+using Serilog;
+using ShellProgressBar;
 
+// Отключаем в консоли возможность редактирования
+DisableConsoleQuickEdit.Go();
+
+using IHost host = Host.CreateDefaultBuilder(args).Build();
 var comaprer = new HashComparer();
-var folder = @"";
 
-if (!Directory.Exists(folder))
-    return;
+//Подключаем файл конфигурации
+IConfiguration _configuration = new ConfigurationBuilder()
+    .AddJsonFile("appsettings.json")
+    .Build();
 
-var dir = new DirectoryInfo(folder).GetFiles("*", SearchOption.AllDirectories);
+//Внедрение сервисов
+static IServiceProvider ConfigureServices(IConfiguration configuration)
+{
+    ServiceCollection services = new();
+    services.AddSingleton(configuration);
+    services.AddLogging(builder => builder.AddSerilog(new LoggerConfiguration().ReadFrom.Configuration(configuration).CreateLogger()));
+    return services.BuildServiceProvider();
+}
+
+IServiceProvider ServiceProvider = ConfigureServices(_configuration);
+ILogger<Program> _logger = ServiceProvider.GetRequiredService<ILogger<Program>>();
+
+// Читаем папку, проверяем существует ли
+var _folder = _configuration.GetSection("AppConfig:Folder").Value;
+if (!Directory.Exists(_folder))
+{
+    _logger.LogError("Directory not exists {directory}", _folder);
+    Console.ReadKey();
+    Environment.Exit(0);
+}
+
+// Ищем файлы в папке + вложенные
+var dir = new DirectoryInfo(_folder).GetFiles("*", SearchOption.AllDirectories);
+
 List<string> filesToAdd = [];
 HashHistory? fileHistory;
+string fileName = string.Empty;
 
-
-for (int i = 0; i < dir.Length; i++)
+// Прогресс бар
+var options = new ProgressBarOptions
 {
-    if (comaprer.HasHistory)
-    {
-        fileHistory = comaprer.History?.HashHistories.FirstOrDefault(x => x.FilePath == dir[i].FullName);
+    ProgressCharacter = '─',
+    ProgressBarOnBottom = false,
+    EnableTaskBarProgress = true,
+    ForegroundColor = ConsoleColor.Yellow,
+    BackgroundCharacter = '\u2593',
+    ForegroundColorDone = ConsoleColor.DarkGreen,
+};
 
-        if (fileHistory != null && !await comaprer.IsSimillarByHash(fileHistory, dir[i].FullName))
+using (var pbar = new ProgressBar(dir.Length, "Processing files.", options))
+{
+    for (int i = 0; i < dir.Length; i++)
+    {
+        if (comaprer.HasHistory)
+        {
+            fileName = dir[i].FullName;
+
+            fileHistory = comaprer.History?.HashHistories.FirstOrDefault(x => x.FilePath == fileName);
+
+            if (fileHistory == null || !await comaprer.IsSimillarByHash(fileHistory, fileName))
+                filesToAdd.Add(dir[i].FullName);
+        }
+        else
         {
             filesToAdd.Add(dir[i].FullName);
         }
-    }
-    else
-    {
-        filesToAdd.Add(dir[i].FullName);
-    }
 
-    Console.SetCursorPosition(0, 0);
-    Console.WriteLine($"Processing files... {Math.Round((decimal)i/dir.Length * 100)}%");
+        pbar.Tick();
+    }
 }
 
-Console.WriteLine($"History parsing completed.");
-Console.WriteLine();
+_logger.LogWarning("History parsing completed.");
+_logger.LogWarning("Saving history.");
 
-Console.WriteLine("Saving history.");
 await comaprer.SaveHashHistory(dir.Select(x => x.FullName));
 
 
-if(filesToAdd.Count != 0)
+if (filesToAdd.Count != 0)
 {
-    var pBar = 0;
-    var pMax = filesToAdd.Count;
-
-    Console.WriteLine("Creating zip file...");
+    _logger.LogWarning("Creating zip file.");
 
     using ZipFile zip = new()
     {
         UseZip64WhenSaving = Zip64Option.Always,
         CompressionLevel = Ionic.Zlib.CompressionLevel.BestCompression,
-        CompressionMethod = CompressionMethod.BZip2 // or CompressionMethod.Deflate or CompressionMethod.None
+        CompressionMethod = CompressionMethod.Deflate // or CompressionMethod.Deflate or CompressionMethod.None
     };
 
     zip.AddFiles(filesToAdd);
 
-    Console.WriteLine();
-    Console.WriteLine("Entry bytes reading.");
-    var (Left, Top) = Console.GetCursorPosition();
+    _logger.LogWarning("Entry bytes reading.");
+    var pbar2 = new ProgressBar(filesToAdd.Count, "Packing zip file", options);
 
     zip.SaveProgress += (sender, e) =>
     {
         if (e.EventType == ZipProgressEventType.Saving_BeforeWriteEntry)
-        {
-            Console.SetCursorPosition(Left, Top);
-            Console.WriteLine($"Writing zip... {Math.Round((decimal)pBar++ / pMax * 100)}%");
-        }
+            pbar2.Tick();
     };
 
-    (Left, Top) = Console.GetCursorPosition();
-
-    Console.SetCursorPosition(Left, Top+3);
-
-    zip.Save(@"arch.zip");
-    Console.WriteLine("Archive saved.");
+    zip.Save($"arch{DateTime.Now:mmfff}.zip");
+    _logger.LogWarning("Archive saved.");
 }
 else
 {
-    Console.WriteLine("Files has no changes.");
+    _logger.LogWarning("Files has no changes.");
 }
 
 Console.ReadKey();
